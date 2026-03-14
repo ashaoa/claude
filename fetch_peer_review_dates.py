@@ -2,9 +2,9 @@
 
 import re
 import time
+import urllib.error
+import urllib.request
 from html.parser import HTMLParser
-
-import requests
 
 
 DOIS = [
@@ -163,7 +163,6 @@ def extract_peer_review_date(html: str) -> str | None:
 
 def fetch_peer_review_date(
     doi: str,
-    session: requests.Session,
     delay: float = 1.0,
 ) -> str | None:
     """Fetch the eLife article page and return the peer-review date string.
@@ -172,8 +171,6 @@ def fetch_peer_review_date(
     ----------
     doi:
         An eLife DOI such as ``"10.7554/elife.100268.3"``.
-    session:
-        A :class:`requests.Session` used for the HTTP request.
     delay:
         Seconds to sleep *after* the request (polite crawling).
 
@@ -184,15 +181,16 @@ def fetch_peer_review_date(
         if the page could not be fetched or the element was not found.
     """
     url = doi_to_url(doi)
+    req = urllib.request.Request(url, headers=HEADERS)
     try:
-        resp = session.get(url, headers=HEADERS, timeout=30)
-        resp.raise_for_status()
-    except requests.RequestException as exc:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            html = resp.read().decode("utf-8", errors="replace")
+    except (urllib.error.URLError, OSError) as exc:
         print(f"  ERROR fetching {url}: {exc}")
         return None
     finally:
         time.sleep(delay)
-    return extract_peer_review_date(resp.text)
+    return extract_peer_review_date(html)
 
 
 def fetch_all(
@@ -211,11 +209,10 @@ def fetch_all(
     if dois is None:
         dois = DOIS
     results: dict[str, str | None] = {}
-    with requests.Session() as session:
-        for doi in dois:
-            print(f"Fetching {doi} …")
-            results[doi] = fetch_peer_review_date(doi, session, delay=delay)
-            print(f"  -> {results[doi]}")
+    for doi in dois:
+        print(f"Fetching {doi} …")
+        results[doi] = fetch_peer_review_date(doi, delay=delay)
+        print(f"  -> {results[doi]}")
     return results
 
 

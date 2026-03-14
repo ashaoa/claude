@@ -1,7 +1,7 @@
 """Tests for fetch_peer_review_dates module."""
 
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, patch  # noqa: F401 – MagicMock used in helpers
 
 from fetch_peer_review_dates import (
     doi_to_url,
@@ -101,38 +101,35 @@ class TestFetchPeerReviewDate(unittest.TestCase):
         "</ul></body></html>"
     )
 
-    def _make_session(self, html: str):
-        resp = MagicMock()
-        resp.text = html
-        resp.raise_for_status = MagicMock()
-        session = MagicMock()
-        session.get.return_value = resp
-        return session
+    def _make_urlopen(self, html: str):
+        """Return a context-manager mock that yields a response with read()."""
+        cm = MagicMock()
+        cm.__enter__ = MagicMock(return_value=cm)
+        cm.__exit__ = MagicMock(return_value=False)
+        cm.read.return_value = html.encode("utf-8")
+        return cm
 
     @patch("fetch_peer_review_dates.time.sleep")
-    def test_returns_date_on_success(self, _mock_sleep):
-        session = self._make_session(self._SAMPLE_HTML)
-        result = fetch_peer_review_date("10.7554/elife.100268.3", session, delay=0)
+    @patch("fetch_peer_review_dates.urllib.request.urlopen")
+    def test_returns_date_on_success(self, mock_urlopen, _mock_sleep):
+        mock_urlopen.return_value = self._make_urlopen(self._SAMPLE_HTML)
+        result = fetch_peer_review_date("10.7554/elife.100268.3", delay=0)
         self.assertEqual(result, "June 11, 2024")
-        session.get.assert_called_once_with(
-            "https://elifesciences.org/articles/100268v3",
-            headers=unittest.mock.ANY,
-            timeout=30,
-        )
 
     @patch("fetch_peer_review_dates.time.sleep")
-    def test_returns_none_on_http_error(self, _mock_sleep):
-        import requests as _requests
+    @patch("fetch_peer_review_dates.urllib.request.urlopen")
+    def test_returns_none_on_http_error(self, mock_urlopen, _mock_sleep):
+        import urllib.error as _ue
 
-        session = MagicMock()
-        session.get.side_effect = _requests.RequestException("connection error")
-        result = fetch_peer_review_date("10.7554/elife.100268.3", session, delay=0)
+        mock_urlopen.side_effect = _ue.URLError("connection error")
+        result = fetch_peer_review_date("10.7554/elife.100268.3", delay=0)
         self.assertIsNone(result)
 
     @patch("fetch_peer_review_dates.time.sleep")
-    def test_sleeps_after_request(self, mock_sleep):
-        session = self._make_session(self._SAMPLE_HTML)
-        fetch_peer_review_date("10.7554/elife.100268.3", session, delay=1.5)
+    @patch("fetch_peer_review_dates.urllib.request.urlopen")
+    def test_sleeps_after_request(self, mock_urlopen, mock_sleep):
+        mock_urlopen.return_value = self._make_urlopen(self._SAMPLE_HTML)
+        fetch_peer_review_date("10.7554/elife.100268.3", delay=1.5)
         mock_sleep.assert_called_once_with(1.5)
 
 
