@@ -2,35 +2,21 @@
 Extract the Data Availability Statement from a DOI article URL.
 
 Install dependencies (Replit Shell):
-    pip install requests beautifulsoup4 playwright
-    playwright install chromium
+    pip install requests beautifulsoup4 selenium webdriver-manager
 """
 
+import json
+import re
 import requests
 from bs4 import BeautifulSoup
 
 
 # ---------------------------------------------------------------------------
-# Strategy 1: requests + BeautifulSoup (fast, works for SSR pages)
+# Shared HTML parser
 # ---------------------------------------------------------------------------
 
-def _extract_with_requests(url: str) -> tuple[str, str] | None:
-    """Returns (heading, content) or None if not found."""
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0.0.0 Safari/537.36"
-        ),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    }
-    resp = requests.get(url, headers=headers, allow_redirects=True, timeout=30)
-    resp.raise_for_status()
-    return _parse_html(resp.text)
-
-
 def _parse_html(html: str) -> tuple[str, str] | None:
-    """Parse raw HTML and return (heading_text, content) or None."""
+    """Parse rendered HTML and return (heading_text, content) or None."""
     soup = BeautifulSoup(html, "html.parser")
 
     heading_tag = None
@@ -46,7 +32,7 @@ def _parse_html(html: str) -> tuple[str, str] | None:
     heading_text = heading_tag.get_text(strip=True)
     tag_level = int(heading_tag.name[1])
 
-    # --- Strategy A: next siblings until next heading ---
+    # Strategy A: collect sibling elements until the next heading
     content_parts = []
     for sibling in heading_tag.find_next_siblings():
         name = sibling.name
@@ -59,12 +45,10 @@ def _parse_html(html: str) -> tuple[str, str] | None:
     if content_parts:
         return heading_text, "\n".join(content_parts).strip()
 
-    # --- Strategy B: parent container text (minus heading) ---
+    # Strategy B: parent container text minus the heading
     parent = heading_tag.find_parent(["section", "article", "div"])
     if parent:
-        full_text = parent.get_text(separator=" ", strip=True)
-        # Remove the heading text from the start
-        content = full_text.replace(heading_text, "", 1).strip()
+        content = parent.get_text(separator=" ", strip=True).replace(heading_text, "", 1).strip()
         if content:
             return heading_text, content
 
@@ -72,52 +56,128 @@ def _parse_html(html: str) -> tuple[str, str] | None:
 
 
 # ---------------------------------------------------------------------------
-# Strategy 2: Playwright (handles JavaScript-rendered / React / MUI pages)
+# Strategy 1: requests — plain HTML (fast, works for SSR pages)
 # ---------------------------------------------------------------------------
 
-def _ensure_playwright_browser() -> None:
-    """Auto-installs Chromium if not yet downloaded."""
-    import subprocess, sys  # noqa: PLC0415
-    print("[playwright] Installing Chromium browser (one-time setup)...")
-    # Use sys.executable so it works even when 'playwright' is not in PATH (e.g. Replit)
-    result = subprocess.run(
-        [sys.executable, "-m", "playwright", "install", "chromium"],
-        check=True,
-        capture_output=False,
-    )
-    print("[playwright] Chromium installed successfully.")
+def _fetch_html_requests(url: str) -> str:
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    }
+    resp = requests.get(url, headers=headers, allow_redirects=True, timeout=30)
+    resp.raise_for_status()
+    return resp.text
 
 
-def _extract_with_playwright(url: str) -> tuple[str, str] | None:
+# ---------------------------------------------------------------------------
+# Strategy 2: embedded JSON (Next.js / React apps store data in __NEXT_DATA__)
+# ---------------------------------------------------------------------------
+
+def _search_json(obj, keywords: list[str]) -> str | None:
+    """Recursively search a JSON object for a string value matching keywords."""
+    if isinstance(obj, str):
+        low = obj.lower()
+        if any(k in low for k in keywords) and len(obj) > 30:
+            return obj
+    elif isinstance(obj, dict):
+        for v in obj.values():
+            result = _search_json(v, keywords)
+            if result:
+                return result
+    elif isinstance(obj, list):
+        for item in obj:
+            result = _search_json(item, keywords)
+            if result:
+                return result
+    return None
+
+
+def _extract_from_embedded_json(html: str) -> tuple[str, str] | None:
     """
-    Uses a headless Chromium browser to render the page, then parses the HTML.
-    Requires: pip install playwright  (browser is auto-downloaded on first run)
+    Look for data embedded in <script> tags (Next.js __NEXT_DATA__, etc.)
+    and search for Data Availability Statement content.
     """
-    from playwright.sync_api import sync_playwright  # noqa: PLC0415
+    soup = BeautifulSoup(html, "html.parser")
 
-    def _launch_and_fetch(p):
-        browser = p.chromium.launch(headless=True)
-        page = browser.new_page()
-        page.goto(url, wait_until="networkidle", timeout=60_000)
+    # Patterns to check: id="__NEXT_DATA__", type="application/json", or inline JSON vars
+    script_tags = soup.find_all("script", {"id": "__NEXT_DATA__"})
+    script_tags += soup.find_all("script", {"type": "application/json"})
+    # Also check plain scripts containing large JSON blobs
+    for s in soup.find_all("script"):
+        text = s.string or ""
+        if len(text) > 500 and ("dataAvailability" in text or "data_availability" in text
+                                 or "DataAvailability" in text):
+            script_tags.append(s)
+
+    keywords = ["data availability", "data statement"]
+
+    for script in script_tags:
+        raw = script.string
+        if not raw:
+            continue
+        # Strip leading variable assignment like: window.__X = {...}
+        raw = re.sub(r"^[^{[]*", "", raw.strip())
         try:
-            page.wait_for_selector("h2, h3", timeout=15_000)
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+
+        content = _search_json(data, keywords)
+        if content:
+            # Strip HTML tags if the content is HTML
+            clean = BeautifulSoup(content, "html.parser").get_text(separator=" ", strip=True)
+            if clean:
+                return "Data availability statement", clean
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Strategy 3: Selenium headless Chrome (handles JS-rendered pages on Replit)
+# ---------------------------------------------------------------------------
+
+def _fetch_html_selenium(url: str) -> str:
+    from selenium import webdriver                              # noqa: PLC0415
+    from selenium.webdriver.chrome.options import Options       # noqa: PLC0415
+    from selenium.webdriver.chrome.service import Service       # noqa: PLC0415
+    from selenium.webdriver.support.ui import WebDriverWait     # noqa: PLC0415
+    from selenium.webdriver.support import expected_conditions as EC  # noqa: PLC0415
+    from selenium.webdriver.common.by import By                 # noqa: PLC0415
+
+    options = Options()
+    options.add_argument("--headless=new")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--window-size=1280,800")
+
+    # Try webdriver-manager first (auto-downloads matching ChromeDriver)
+    try:
+        from webdriver_manager.chrome import ChromeDriverManager  # noqa: PLC0415
+        driver = webdriver.Chrome(
+            service=Service(ChromeDriverManager().install()),
+            options=options,
+        )
+    except Exception:
+        # Fall back to system chromedriver
+        driver = webdriver.Chrome(options=options)
+
+    try:
+        driver.get(url)
+        # Wait up to 20s for an h2 or h3 to appear (page JS to finish)
+        try:
+            WebDriverWait(driver, 20).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, "h2, h3"))
+            )
         except Exception:
             pass
-        html = page.content()
-        browser.close()
-        return html
-
-    with sync_playwright() as p:
-        try:
-            html = _launch_and_fetch(p)
-        except Exception as e:
-            if "Executable doesn't exist" in str(e):
-                _ensure_playwright_browser()
-                html = _launch_and_fetch(p)
-            else:
-                raise
-
-    return _parse_html(html)
+        return driver.page_source
+    finally:
+        driver.quit()
 
 
 # ---------------------------------------------------------------------------
@@ -128,51 +188,51 @@ def extract_data_availability_statement(doi_url: str) -> dict:
     """
     Extracts the Data Availability Statement from a DOI article.
 
-    Tries fast requests-based fetch first; falls back to Playwright
-    (headless browser) for JavaScript-rendered pages like React/MUI.
+    Order of attempts:
+      1. requests + plain HTML parse
+      2. requests + embedded JSON parse (Next.js __NEXT_DATA__ etc.)
+      3. Selenium headless Chrome (full JS rendering)
     """
     print(f"Fetching: {doi_url}")
 
-    # --- Try requests first (fast) ---
+    # Step 1 & 2: requests (no browser needed)
     try:
-        result = _extract_with_requests(doi_url)
-        if result and result[1]:
-            heading, content = result
-            print("[requests] Found statement.")
-            return {"doi_url": doi_url, "heading": heading, "content": content}
-        elif result:
-            print("[requests] Found heading but no content — trying Playwright...")
-        else:
-            print("[requests] Heading not found — trying Playwright...")
-    except Exception as e:
-        print(f"[requests] Error: {e} — trying Playwright...")
+        html = _fetch_html_requests(doi_url)
 
-    # --- Fall back to Playwright (handles JS-rendered pages) ---
+        result = _parse_html(html)
+        if result and result[1]:
+            print("[requests/html] Found statement.")
+            return {"doi_url": doi_url, "heading": result[0], "content": result[1]}
+
+        result = _extract_from_embedded_json(html)
+        if result and result[1]:
+            print("[requests/json] Found statement in embedded JSON.")
+            return {"doi_url": doi_url, "heading": result[0], "content": result[1]}
+
+        print("[requests] Not found in static HTML or embedded JSON — trying Selenium...")
+    except Exception as e:
+        print(f"[requests] Error: {e} — trying Selenium...")
+
+    # Step 3: Selenium (full JS rendering)
     try:
-        result = _extract_with_playwright(doi_url)
+        html = _fetch_html_selenium(doi_url)
+        result = _parse_html(html)
         if result:
             heading, content = result
-            if content:
-                print("[playwright] Found statement.")
-                return {"doi_url": doi_url, "heading": heading, "content": content}
-            else:
-                return {
-                    "doi_url": doi_url,
-                    "heading": heading,
-                    "content": "Heading found but no content could be extracted.",
-                }
-        else:
-            return {"doi_url": doi_url, "error": "Data availability statement not found on page."}
+            print("[selenium] Found statement." if content else "[selenium] Heading found, no content.")
+            return {
+                "doi_url": doi_url,
+                "heading": heading,
+                "content": content or "Heading found but no content could be extracted.",
+            }
+        return {"doi_url": doi_url, "error": "Data availability statement not found on page."}
     except ImportError:
         return {
             "doi_url": doi_url,
-            "error": (
-                "Page requires JavaScript rendering but Playwright is not installed.\n"
-                "Run:  pip install playwright && playwright install chromium"
-            ),
+            "error": "Selenium not installed. Run: pip install selenium webdriver-manager",
         }
     except Exception as e:
-        return {"doi_url": doi_url, "error": f"Playwright error: {e}"}
+        return {"doi_url": doi_url, "error": f"Selenium error: {e}"}
 
 
 # ---------------------------------------------------------------------------
