@@ -77,9 +77,15 @@ def _parse_html(html: str) -> tuple[str, str] | None:
 
 def _ensure_playwright_browser() -> None:
     """Auto-installs Chromium if not yet downloaded."""
-    import subprocess  # noqa: PLC0415
+    import subprocess, sys  # noqa: PLC0415
     print("[playwright] Installing Chromium browser (one-time setup)...")
-    subprocess.run(["playwright", "install", "chromium"], check=True)
+    # Use sys.executable so it works even when 'playwright' is not in PATH (e.g. Replit)
+    result = subprocess.run(
+        [sys.executable, "-m", "playwright", "install", "chromium"],
+        check=True,
+        capture_output=False,
+    )
+    print("[playwright] Chromium installed successfully.")
 
 
 def _extract_with_playwright(url: str) -> tuple[str, str] | None:
