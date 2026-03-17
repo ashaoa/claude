@@ -75,31 +75,41 @@ def _parse_html(html: str) -> tuple[str, str] | None:
 # Strategy 2: Playwright (handles JavaScript-rendered / React / MUI pages)
 # ---------------------------------------------------------------------------
 
+def _ensure_playwright_browser() -> None:
+    """Auto-installs Chromium if not yet downloaded."""
+    import subprocess  # noqa: PLC0415
+    print("[playwright] Installing Chromium browser (one-time setup)...")
+    subprocess.run(["playwright", "install", "chromium"], check=True)
+
+
 def _extract_with_playwright(url: str) -> tuple[str, str] | None:
     """
     Uses a headless Chromium browser to render the page, then parses the HTML.
-    Requires: pip install playwright && playwright install chromium
+    Requires: pip install playwright  (browser is auto-downloaded on first run)
     """
     from playwright.sync_api import sync_playwright  # noqa: PLC0415
 
-    with sync_playwright() as p:
+    def _launch_and_fetch(p):
         browser = p.chromium.launch(headless=True)
         page = browser.new_page()
-
-        # Follow DOI redirects automatically
         page.goto(url, wait_until="networkidle", timeout=60_000)
-
-        # Try to find the heading directly via CSS/text
         try:
-            page.wait_for_selector(
-                "h2, h3",
-                timeout=15_000,
-            )
+            page.wait_for_selector("h2, h3", timeout=15_000)
         except Exception:
             pass
-
         html = page.content()
         browser.close()
+        return html
+
+    with sync_playwright() as p:
+        try:
+            html = _launch_and_fetch(p)
+        except Exception as e:
+            if "Executable doesn't exist" in str(e):
+                _ensure_playwright_browser()
+                html = _launch_and_fetch(p)
+            else:
+                raise
 
     return _parse_html(html)
 
